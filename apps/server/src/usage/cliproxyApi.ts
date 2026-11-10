@@ -9,6 +9,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 
@@ -16,6 +17,12 @@ import { codexPlanLabel } from "../provider/CodexProvider.ts";
 import { codexRateLimitsToLimits } from "../provider/codexUsageLimits.ts";
 import { claudeUsageResponseToLimits } from "../provider/claudeUsageLimits.ts";
 import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
+import {
+  GROK_BILLING_URL,
+  GrokUsageResponse,
+  grokUsagePeriodType,
+  grokUsageResponseToLimits,
+} from "@t3tools/provider-grok/server/usageLimits";
 
 const AuthFile = Schema.Struct({
   id: Schema.String,
@@ -87,6 +94,7 @@ const decodeApiResponse = Schema.decodeUnknownEffect(ApiResponse);
 const decodeCreditList = Schema.decodeUnknownEffect(Schema.fromJsonString(CreditList));
 const decodeClaudeUsage = Schema.decodeUnknownEffect(Schema.fromJsonString(ClaudeUsage));
 const decodeCodexUsage = Schema.decodeUnknownEffect(Schema.fromJsonString(CodexUsage));
+const decodeGrokUsage = Schema.decodeUnknownEffect(Schema.fromJsonString(GrokUsageResponse));
 const isUsageLimitSourceError = Schema.is(UsageLimitSourceError);
 const decodeConsumeResponse = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
@@ -95,6 +103,20 @@ const decodeConsumeResponse = Schema.decodeUnknownEffect(
     }),
   ),
 );
+
+const SUPPORTED_PROVIDERS = new Set(["codex", "claude", "xai"]);
+const DRIVERS: Record<string, string> = { codex: "codex", xai: "grok" };
+
+// Hub-held xAI logins are Grok CLI sessions. This is the header set already proven
+// against a live hub; the local driver's bearer-only call is untested through one.
+const GROK_CLI_VERSION = "1.0.46";
+const GROK_HEADERS = {
+  Authorization: "Bearer $TOKEN$",
+  "x-xai-token-auth": "xai-grok-cli",
+  "x-grok-client-version": GROK_CLI_VERSION,
+  accept: "*/*",
+  "user-agent": `grok-pager/${GROK_CLI_VERSION} grok-shell/${GROK_CLI_VERSION} (macos; aarch64)`,
+};
 
 const CODEX_BASE = "https://chatgpt.com/backend-api/wham";
 const CREDIT_URL = `${CODEX_BASE}/rate-limit-reset-credits`;
@@ -154,24 +176,26 @@ export const makeCliproxyApi = Effect.gen(function* () {
     return (yield* decodeAuthFiles(response)).files;
   });
 
-  const apiCall = Effect.fn("CliproxyApi.apiCall")(function* (
+  const rawApiCall = Effect.fn("CliproxyApi.rawApiCall")(function* (
     config: UsageLimitSourceConfig,
     account: typeof AuthFile.Type,
     url: string,
     data?: unknown,
   ) {
     const header =
-      account.provider === "codex"
-        ? {
-            Authorization: "Bearer $TOKEN$",
-            "Content-Type": "application/json",
-            "OpenAI-Beta": "codex-1",
-            Originator: "Codex Desktop",
-            ...(account.id_token?.chatgpt_account_id
-              ? { "Chatgpt-Account-Id": account.id_token.chatgpt_account_id }
-              : {}),
-          }
-        : { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20" };
+      account.provider === "xai"
+        ? GROK_HEADERS
+        : account.provider === "codex"
+          ? {
+              Authorization: "Bearer $TOKEN$",
+              "Content-Type": "application/json",
+              "OpenAI-Beta": "codex-1",
+              Originator: "Codex Desktop",
+              ...(account.id_token?.chatgpt_account_id
+                ? { "Chatgpt-Account-Id": account.id_token.chatgpt_account_id }
+                : {}),
+            }
+          : { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20" };
     const raw = yield* management(config, "api-call", {
       auth_index: account.auth_index,
       method: data === undefined ? "GET" : "POST",
@@ -179,13 +203,47 @@ export const makeCliproxyApi = Effect.gen(function* () {
       header,
       ...(data === undefined ? {} : { data: yield* encodeJson(data) }),
     });
-    const response = yield* decodeApiResponse(raw);
-    if (response.status_code < 200 || response.status_code >= 300) {
-      return yield* new UsageLimitSourceError({
-        detail: `The provider refused the hub request (HTTP ${response.status_code}).`,
-      });
+    return yield* decodeApiResponse(raw);
+  });
+
+  const checkStatus = (response: typeof ApiResponse.Type) =>
+    response.status_code < 200 || response.status_code >= 300
+      ? Effect.fail(
+          new UsageLimitSourceError({
+            detail: `The provider refused the hub request (HTTP ${response.status_code}).`,
+          }),
+        )
+      : Effect.succeed(response.body);
+
+  const apiCall = Effect.fn("CliproxyApi.apiCall")(function* (
+    config: UsageLimitSourceConfig,
+    account: typeof AuthFile.Type,
+    url: string,
+    data?: unknown,
+  ) {
+    return yield* checkStatus(yield* rawApiCall(config, account, url, data));
+  });
+
+  const readGrokLimits = Effect.fn("CliproxyApi.readGrokLimits")(function* (
+    config: UsageLimitSourceConfig,
+    account: typeof AuthFile.Type,
+    checkedAt: string,
+  ) {
+    // xAI's meter answers 503 for team logins now and then, and it clears within seconds.
+    const response = yield* rawApiCall(config, account, GROK_BILLING_URL).pipe(
+      Effect.repeat({
+        schedule: Schedule.spaced("2 seconds"),
+        times: 2,
+        while: (response) => response.status_code === 503,
+      }),
+    );
+    const usage = yield* decodeGrokUsage(yield* checkStatus(response));
+    // xAI sometimes answers without the weekly period. That answer's missing
+    // percentage is not zero usage, so treat it as a failed read.
+    if (grokUsagePeriodType(usage) !== "WEEKLY" || !usage.config?.currentPeriod?.end) {
+      return yield* new UsageLimitSourceError({ detail: "Grok billing has no weekly period." });
     }
-    return response.body;
+    return grokUsageResponseToLimits(usage, checkedAt);
   });
 
   const credits = Effect.fn("CliproxyApi.credits")(function* (
@@ -212,13 +270,20 @@ export const makeCliproxyApi = Effect.gen(function* () {
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     const base = {
       id: account.id,
-      driver: ProviderDriverKind.make(account.provider === "codex" ? "codex" : "claudeAgent"),
+      driver: ProviderDriverKind.make(DRIVERS[account.provider] ?? "claudeAgent"),
       ...(account.email ? { email: account.email } : {}),
       ...(account.id_token?.chatgpt_account_id?.trim()
         ? { workspaceId: account.id_token.chatgpt_account_id.trim() }
         : {}),
     };
     const read = Effect.gen(function* () {
+      if (account.provider === "xai") {
+        return {
+          ...base,
+          plan: "Grok account",
+          usageLimits: yield* readGrokLimits(config, account, checkedAt),
+        };
+      }
       if (account.provider === "claude") {
         const body = yield* apiCall(config, account, "https://api.anthropic.com/api/oauth/usage");
         const usage = yield* decodeClaudeUsage(body);
@@ -312,10 +377,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
       ),
     );
     return yield* Effect.forEach(
-      accounts.filter(
-        (account) =>
-          !account.disabled && (account.provider === "codex" || account.provider === "claude"),
-      ),
+      accounts.filter((account) => !account.disabled && SUPPORTED_PROVIDERS.has(account.provider)),
       (account) => readAccount(config, account),
       { concurrency: 4 },
     );

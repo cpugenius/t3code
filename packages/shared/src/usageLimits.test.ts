@@ -216,6 +216,59 @@ describe("pools", () => {
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
   });
 
+  it("shows one Grok row for a login that is both local and on a hub", () => {
+    const grok = ProviderDriverKind.make("grok");
+    const weeklyGrok = { ...weekly, id: "subscription" };
+    const native = provider({
+      driver: grok,
+      instanceId: ProviderInstanceId.make("grok"),
+      auth: { status: "authenticated", email: "Me@example.com", label: "Grok account" },
+      usageLimits: { checkedAt, windows: [{ ...weeklyGrok, usedPercent: 30 }] },
+    });
+    const hubAccount = (id: string, email: string, usedPercent: number) => ({
+      id,
+      driver: grok,
+      email,
+      plan: "Grok account",
+      usageLimits: {
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        windows: [{ ...weeklyGrok, usedPercent }],
+      },
+    });
+    const accounts = collectLimitAccounts(
+      new Map([
+        [
+          EnvironmentId.make("env-a"),
+          {
+            ...laptop,
+            serverConfig: {
+              providers: [native],
+              usageLimitSources: [
+                {
+                  ...source,
+                  accounts: [
+                    hubAccount("me.json", "me@example.com", 35),
+                    hubAccount("team.json", "team@example.com", 60),
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      ]),
+    );
+    expect(
+      accounts.map((account) => [
+        account.email,
+        account.sourceLabel,
+        account.limits.windows[0]?.usedPercent,
+      ]),
+    ).toEqual([
+      ["Me@example.com", null, 35],
+      ["team@example.com", "hub", 60],
+    ]);
+  });
+
   it("merges OpenCode Go limits from machines with the same API key", () => {
     const go = provider({
       driver: ProviderDriverKind.make("opencode"),
@@ -1010,6 +1063,40 @@ describe("collectLimitNotices", () => {
             usageLimitSources: [
               hub,
               { ...hub, id: UsageLimitSourceId.make("down"), label: "down", error: "ECONNREFUSED" },
+              {
+                ...hub,
+                id: UsageLimitSourceId.make("grok-hub"),
+                label: "grok-hub",
+                accounts: [
+                  {
+                    id: "team.json",
+                    driver: ProviderDriverKind.make("grok"),
+                    email: "team@example.com",
+                    usageLimits: {
+                      checkedAt,
+                      windows: [],
+                      unavailable: {
+                        reason: "probeFailed" as const,
+                        message: "The hub could not read this account's usage.",
+                      },
+                    },
+                  },
+                  {
+                    id: "key.json",
+                    driver: ProviderDriverKind.make("grok"),
+                    usageLimits: {
+                      checkedAt,
+                      windows: [],
+                      unavailable: { reason: "unsupported" as const },
+                    },
+                  },
+                  {
+                    id: "fine.json",
+                    driver: ProviderDriverKind.make("grok"),
+                    usageLimits: { checkedAt, windows: [window] },
+                  },
+                ],
+              },
             ],
           },
         },
@@ -1020,6 +1107,7 @@ describe("collectLimitNotices", () => {
       "codex: No limits reported.",
       "hub: No accounts reported.",
       "down: ECONNREFUSED",
+      "grok-hub · team@example.com: The hub could not read this account's usage.",
     ]);
 
     one.set(EnvironmentId.make("env-b"), {

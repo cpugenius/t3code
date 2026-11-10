@@ -1,6 +1,7 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/http";
@@ -46,9 +47,30 @@ type RequestBody = typeof RequestBody.Type;
 const decodeRequest = Schema.decodeUnknownSync(Schema.fromJsonString(RequestBody));
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
+type HubAccount = Omit<(typeof accounts)[number], "id_token"> & {
+  id_token?: (typeof accounts)[number]["id_token"];
+  disabled?: boolean;
+};
+const xaiAccount = (id: string, auth_index: string, disabled?: boolean): HubAccount => ({
+  id,
+  auth_index,
+  provider: "xai",
+  email: `${id.replace(/\.json$/, "")}@example.com`,
+  ...(disabled === undefined ? {} : { disabled }),
+});
+const weeklyBilling = (creditUsagePercent?: number) => ({
+  status: 200,
+  body: {
+    config: {
+      ...(creditUsagePercent === undefined ? {} : { creditUsagePercent }),
+      currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2099-01-05T00:00:00Z" },
+    },
+  },
+});
+
 function fixture(
   options: {
-    accounts?: Array<(typeof accounts)[number] & { disabled?: boolean }>;
+    accounts?: Array<HubAccount>;
     upstream?: (request: RequestBody) => { status: number; body: unknown };
     cooldownStatus?: number;
   } = {},
@@ -307,6 +329,114 @@ describe("CLIProxyAPI built-in management API", () => {
       const result = yield* api.consume(config, "missing.json", "credit").pipe(Effect.result);
       expect(result._tag).toBe("Failure");
       expect(test.requests).toHaveLength(1);
+    }),
+  );
+
+  it.effect("reads enabled xAI accounts as Grok weekly credit usage", () =>
+    Effect.gen(function* () {
+      const test = fixture({
+        accounts: [
+          xaiAccount("personal.json", "x1"),
+          xaiAccount("team.json", "x2"),
+          xaiAccount("off.json", "x3", true),
+        ],
+        upstream: (request) => weeklyBilling(request.auth_index === "x1" ? 40 : undefined),
+      });
+      const api = yield* test.api;
+      const result = yield* api.readAccounts(config);
+      expect(result).toMatchObject([
+        {
+          id: "personal.json",
+          driver: "grok",
+          email: "personal@example.com",
+          plan: "Grok account",
+          usageLimits: {
+            windows: [
+              {
+                id: "subscription",
+                kind: "weekly",
+                usedPercent: 40,
+                resetsAt: "2099-01-05T00:00:00.000Z",
+              },
+            ],
+          },
+        },
+        // A weekly period without a percent is an account that has not used anything yet.
+        { id: "team.json", usageLimits: { windows: [{ kind: "weekly", usedPercent: 0 }] } },
+      ]);
+      expect(result).toHaveLength(2);
+      const calls = test.requests.filter((request) => request.body?.url);
+      expect(calls.map((request) => request.body?.auth_index).sort()).toEqual(["x1", "x2"]);
+      expect(calls[0]?.body).toMatchObject({
+        method: "GET",
+        url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        header: { "x-xai-token-auth": "xai-grok-cli" },
+      });
+    }),
+  );
+
+  it.effect("retries a transient xAI 503 before reading the account", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const test = fixture({
+        accounts: [xaiAccount("team.json", "x1")],
+        upstream: () => (++attempts < 3 ? { status: 503, body: {} } : weeklyBilling(25)),
+      });
+      const api = yield* test.api;
+      const fiber = yield* api.readAccounts(config).pipe(Effect.forkChild);
+      yield* TestClock.adjust("4 seconds");
+      const result = yield* Fiber.join(fiber);
+      expect(attempts).toBe(3);
+      expect(result[0]?.usageLimits.windows[0]?.usedPercent).toBe(25);
+    }),
+  );
+
+  it.effect("gives up after three xAI 503s and keeps the other accounts", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const test = fixture({
+        accounts: [xaiAccount("team.json", "x1"), xaiAccount("personal.json", "x2")],
+        upstream: (request) =>
+          request.auth_index === "x1" ? (attempts++, { status: 503, body: {} }) : weeklyBilling(10),
+      });
+      const api = yield* test.api;
+      const fiber = yield* api.readAccounts(config).pipe(Effect.forkChild);
+      yield* TestClock.adjust("10 seconds");
+      const result = yield* Fiber.join(fiber);
+      expect(attempts).toBe(3);
+      expect(result[0]?.usageLimits.unavailable).toEqual({
+        reason: "probeFailed",
+        message: "The hub could not read this account's usage.",
+      });
+      expect(result[1]?.usageLimits.windows[0]?.usedPercent).toBe(10);
+    }),
+  );
+
+  it.effect("does not retry an xAI refusal other than 503", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const test = fixture({
+        accounts: [xaiAccount("team.json", "x1")],
+        upstream: () => (attempts++, { status: 401, body: {} }),
+      });
+      const api = yield* test.api;
+      const result = yield* api.readAccounts(config);
+      expect(attempts).toBe(1);
+      expect(result[0]?.usageLimits.unavailable?.reason).toBe("probeFailed");
+    }),
+  );
+
+  it.effect("treats xAI billing without a weekly period as a failed read, not zero use", () =>
+    Effect.gen(function* () {
+      const test = fixture({
+        accounts: [xaiAccount("team.json", "x1")],
+        upstream: () => ({ status: 200, body: { config: {} } }),
+      });
+      const api = yield* test.api;
+      const result = yield* api.readAccounts(config);
+      expect(result[0]?.driver).toBe("grok");
+      expect(result[0]?.usageLimits.unavailable?.reason).toBe("probeFailed");
+      expect(result[0]?.usageLimits.windows).toEqual([]);
     }),
   );
 });
