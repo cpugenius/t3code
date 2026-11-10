@@ -598,6 +598,15 @@ describe("Grok usage limits", () => {
       ).windows,
     ).toEqual([{ id: "subscription", kind: "monthly", label: "Monthly", usedPercent: 100 }]);
   });
+
+  it("reads a weekly period without a percentage as an unused account", () => {
+    expect(
+      grokUsageResponseToLimits(
+        { config: { currentPeriod: { type: "usage_period_type_weekly" } } },
+        checkedAt,
+      ).windows,
+    ).toEqual([{ id: "subscription", kind: "weekly", label: "Weekly", usedPercent: 0 }]);
+  });
 });
 
 it.layer(NodeServices.layer)("readGrokAccount", (it) => {

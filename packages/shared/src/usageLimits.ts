@@ -305,6 +305,12 @@ export function collectLimitNotices(presentations: LimitPresentations): readonly
       } else if (source.accounts.length === 0) {
         notices.push(`${label(environmentLabel, source.label)}: No accounts reported.`);
       }
+      for (const account of source.accounts) {
+        if (account.usageLimits.unavailable?.reason === "unsupported") continue;
+        const notice = limitsNotice(account.usageLimits);
+        const name = `${source.label} · ${account.email ?? account.id}`;
+        if (notice) notices.push(`${label(environmentLabel, name)}: ${notice}`);
+      }
     }
   }
   return notices;

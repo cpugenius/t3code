@@ -24,7 +24,9 @@ const GrokCredentials = Schema.Record(
   }),
 );
 const decodeCredentials = Schema.decodeEffect(Schema.fromJsonString(GrokCredentials));
-const GrokUsageResponse = Schema.Struct({
+export const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+
+export const GrokUsageResponse = Schema.Struct({
   config: Schema.optional(
     Schema.Struct({
       creditUsagePercent: Schema.optional(Schema.Number),
@@ -38,20 +40,24 @@ const GrokUsageResponse = Schema.Struct({
   ),
 });
 
+export function grokUsagePeriodType(response: typeof GrokUsageResponse.Type) {
+  return response.config?.currentPeriod?.type?.toUpperCase().replace(/^USAGE_PERIOD_TYPE_/, "");
+}
+
 export function grokUsageResponseToLimits(
   response: typeof GrokUsageResponse.Type,
   checkedAt: string,
 ) {
-  const usedPercent = response.config?.creditUsagePercent;
+  const periodType = grokUsagePeriodType(response);
+  // xAI omits the percentage, rather than sending 0, until an account uses
+  // something. Inside a weekly period that means 0% used. Without a period the
+  // read says nothing about usage.
+  const usedPercent =
+    response.config?.creditUsagePercent ?? (periodType === "WEEKLY" ? 0 : undefined);
   if (usedPercent === undefined || !Number.isFinite(usedPercent)) {
-    // A billing read that succeeded but carries no percentage is an account
-    // with nothing metered yet, not one that can never report: xAI omits the
-    // field entirely (rather than sending 0) until usage registers, then fills
-    // it in.
     return makeUsageLimits({ checkedAt, windows: [] });
   }
   const period = response.config?.currentPeriod;
-  const periodType = period?.type?.replace(/^USAGE_PERIOD_TYPE_/, "");
   const kind = periodType === "WEEKLY" ? "weekly" : periodType === "MONTHLY" ? "monthly" : "other";
   const reset = period?.end ? DateTime.make(period.end) : Option.none();
   const window: ServerProviderUsageWindow = {
@@ -151,9 +157,7 @@ export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
   const usageLimits = yield* Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
-      HttpClientRequest.get("https://cli-chat-proxy.grok.com/v1/billing?format=credits").pipe(
-        HttpClientRequest.bearerToken(token),
-      ),
+      HttpClientRequest.get(GROK_BILLING_URL).pipe(HttpClientRequest.bearerToken(token)),
     );
     const body = yield* HttpClientResponse.schemaBodyJson(GrokUsageResponse)(
       yield* HttpClientResponse.filterStatusOk(response),
